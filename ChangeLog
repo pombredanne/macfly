@@ -1,0 +1,6 @@
+2008-02-11 - Stéphane Esté-Gracias
+    * Wrap pthread_cond_timedwait()
+
+2007-05-25 - Victor Stinner
+    * Version 1.0 release
+

@@ -15,6 +15,7 @@
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
 DEBUG=0
+USE_PTHREAD=1
 ifeq ($(DEBUG), 1)
     CFLAGS=-Wall -Wextra -g -O0
     STRIP=0
@@ -22,7 +23,12 @@ else
     CFLAGS=-Wall -Wextra -O2
     STRIP=1
 endif
-LIBS=-lpthread
+ifeq ($(USE_PTHREAD), 1)
+    CFLAGS+= -DWRAP_PTHREAD
+    LIBS=-lpthread
+else
+    LIBS=
+endif
 OWNER=-o root -g root
 MODE_EXE=-m 0555
 MODE_SO=-m 0444
@@ -43,7 +49,7 @@ install: libmacfly.so macfly
 uninstall:
 	rm $(BINDIR)/macfly
 	rm $(LIBDIR)/libmacfly.so
-%.o: %.c config.h
+%.o: %.c config.h libmacfly.h
 	gcc -o $@ -c $< -fPIC $(CFLAGS)
 libmacfly.so: $(OBJECTS)
 	gcc -o $@ libmacfly.o network.o wrapper.o -shared -fPIC $(CFLAGS)

@@ -21,19 +21,29 @@
 #include <time.h>          /* time_t */
 #include <sys/timeb.h>     /* struct timeb */
 #include <sys/time.h>      /* struct timeval */
+#ifdef WRAP_PTHREAD
+#  include <pthread.h>       /* pthread structs */
+#endif
 /*--------------------------------------------------------------------------*/
+
 
 typedef time_t (*time_prototype) (time_t*);
 typedef int (*gettimeofday_prototype) (struct timeval *tv, struct timezone *tz);
-typedef int (*clock_gettime_prototype) (clockid_t clk_id, struct timespec *tp);
 typedef int (*ftime_prototype) (struct timeb *tp);
-
-/*--------------------------------------------------------------------------*/
 
 static time_prototype real_time = NULL;
 static gettimeofday_prototype real_gettimeofday = NULL;
 static ftime_prototype real_ftime = NULL;
+
+#ifdef WRAP_CLOCK_GETTIME
+typedef int (*clock_gettime_prototype) (clockid_t clk_id, struct timespec *tp);
 static clock_gettime_prototype real_clock_gettime = NULL;
+#endif
+
+#ifdef WRAP_PTHREAD
+typedef int (*pthread_cond_timedwait_prototype) (pthread_cond_t * cond, pthread_mutex_t * mutex, const struct timespec * abstime);
+static pthread_cond_timedwait_prototype real_pthread_cond_timedwait = NULL;
+#endif
 
 /*--------------------------------------------------------------------------*/
 
@@ -42,7 +52,12 @@ void init_wrappers()
     real_time = (time_prototype)get_symbol("time", 0);
     real_gettimeofday = (gettimeofday_prototype)get_symbol("gettimeofday", 0);
     real_ftime = (ftime_prototype)get_symbol("ftime", 0);
+#ifdef WRAP_CLOCK_GETTIME
     real_clock_gettime = (clock_gettime_prototype)get_symbol("clock_gettime", 0);
+#endif
+#ifdef WRAP_PTHREAD
+    real_pthread_cond_timedwait = (pthread_cond_timedwait_prototype)get_symbol("pthread_cond_timedwait", 0);
+#endif
 }
 
 /*--------------------------------------------------------------------------*/
@@ -57,8 +72,6 @@ static inline time_t update_time_t(time_t value)
     else
         return value + delta.sec;
 }
-
-/*--------------------------------------------------------------------------*/
 
 /**
  * Update a timeval structure with time delta
@@ -85,9 +98,12 @@ static inline void update_timeval(struct timeval *tv)
 /**
  * Update a timespec structure with time delta
  */
-static inline void update_timespec(struct timespec *tp)
+static inline void update_timespec(struct timespec *tp, int inverse)
 {
-    if (delta.is_negative) {
+    int negative = delta.is_negative;
+    if (inverse)
+        negative = !negative;
+    if (negative) {
         tp->tv_sec -= delta.sec;
         if (tp->tv_nsec < (int32_t)delta.nanosec) {
             tp->tv_nsec += 1000000000;
@@ -103,6 +119,8 @@ static inline void update_timespec(struct timespec *tp)
         }
     }
 }
+
+/*--------------------------------------------------------------------------*/
 
 /**
  * Wrapper for time()
@@ -170,6 +188,7 @@ int ftime (struct timeb *tp)
     return res;
 }
 
+#ifdef WRAP_CLOCK_GETTIME
 /**
  * Wrapper for clock_gettime()
  */
@@ -185,10 +204,30 @@ int clock_gettime(clockid_t clk_id, struct timespec *tp)
 #endif
     err = real_clock_gettime(clk_id, tp);
     if (!err && tp) {
-        update_timespec(tp);
-    }
-    return err;
+        update_timespec(tp, 0);
 }
+#endif
+
+#ifdef WRAP_PTHREAD
+/**
+ * Wrapper for pthread_cond_timedwait()
+ */
+int pthread_cond_timedwait(pthread_cond_t * cond,
+              pthread_mutex_t * mutex,
+              const struct timespec * abstime)
+{
+    struct timespec tp;
+
+    if (!real_pthread_cond_timedwait) {
+        real_pthread_cond_timedwait = (pthread_cond_timedwait_prototype)get_symbol("pthread_cond_timedwait", 1);
+    }
+    tp = *abstime;
+
+    network_update();
+    update_timespec(&tp, 1);
+    return real_pthread_cond_timedwait(cond, mutex, &tp);
+}
+#endif
 
 /*--------------------------------------------------------------------------*/
 
