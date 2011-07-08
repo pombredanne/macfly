@@ -1,0 +1,28 @@
+Dependencies
+============
+
+To compile Macfly:
+ * make program
+ * gcc (version 3.x or 4.x)
+ * libc headers (package "libc6-dev")
+ * Python 2.4
+
+For runtime:
+ * Python 2.4
+
+Install
+=======
+
+To install all components, just type:
+  sudo make install
+or
+  su -c "make install"
+
+Uninstall
+=========
+
+To uninstall all components, just type:
+  sudo make uninstall
+or
+  su -c "make uninstall"
+

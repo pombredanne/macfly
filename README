@@ -1,0 +1,9 @@
+Macfly is a set of program and library to run one or more programs with a
+shifted clock. It's a wrapper to libc time functions (eg. gettimeofday()).
+
+Components:
+ * libmacfly.so: wrapper for time functions of libc
+ * macfly: runner for libmacfly.so
+ * deloreand: time server, send time delta updates to libmacfly.so
+ * docbrown: utility to change clock on deloreand
+

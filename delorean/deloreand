@@ -1,0 +1,405 @@
+#!/usr/bin/env python
+
+# Copyright(C) 2007 INL
+# Written by Victor Stinner <victor.stinner AT inl.fr>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+
+from os import getenv, path, close, fork, chdir, setsid, umask, getpid
+from sys import exit, stderr, argv, stdout
+try:
+    import readline
+except ImportError:
+    print "[!] Warning: unable to import readline library"
+from datetime import timedelta
+from time import time, sleep
+from thread import allocate_lock
+from socket import socket, AF_UNIX, error as socket_error
+from struct import pack, calcsize
+from macfly.parse import UNITS, parseDelta, timedeltaFactor
+from macfly.docbrown_client import DockbrownSocket
+from macfly.macfly_client import MacflySocket, SOCKET_FILENAME
+
+MAX_DELTA = timedelta(seconds=(2**32)-1)
+MIN_DELTA = -MAX_DELTA
+
+# Get 32-bit signed integer type
+if calcsize("I") == 4:
+    PACK_UINT32_FORMAT = "I"
+elif calcsize("H") == 4:
+    PACK_UINT32_FORMAT = "H"
+else:
+    print >>stderr, "ERROR: Unable to get struct format"
+    exit(1)
+PACK_FORMAT = "!B%s%s" % (PACK_UINT32_FORMAT, PACK_UINT32_FORMAT)
+
+DELTA0 = timedelta()
+
+def displayHelp():
+    items = UNITS.items()
+    items.sort(lambda x, y: cmp(x[1][0], y[1][0]))
+    keys = ', '.join([item[0] for item in items])
+    print 'Delta syntax:'
+    print '    list of key=value using keys: %s' % keys
+    print '    date: format: YYYY/MM/DD'
+    print '    time: format: HH:MM:SS or HH:MM'
+    print '    datetime: YYYY/MM/DD HH:MM'
+    print
+    print 'Examples:'
+    print '    "hour=+6"'
+    print '    "day=1 sec=-2"'
+    print '    "1999/12/31 23:59:55"'
+    print '    "17:30"'
+    print
+    print 'Special commands:'
+    print '   "current": Display current delta'
+    print '   "speed SPEED [UPDATE]": change clock speed'
+    print '   (eg. "speed 2": clock is 2 times faster)'
+    print '   "reset": Set delta to zero'
+    print '   "help": Display this help'
+    print '   "quit": Quit deloreand"'
+
+class Delorean:
+    def __init__(self, daemon_mode):
+        # Setup filemode for UNIX socket and configuration file
+        umask(0117)
+        self.daemon_mode = daemon_mode
+        self.clients = []
+        self.clients_lock = allocate_lock()
+        self.time_delta = timedelta(seconds=0)
+        self.delta_lock = allocate_lock()
+        self.config_file = None
+        self.load_config()
+        self.macfly = MacflySocket(self)
+        if self.daemon_mode:
+            self.docbrown = DockbrownSocket(self)
+            self.daemonize()
+        else:
+            self.docbrown = None
+        self.pid = getpid()
+
+    def daemonize(self):
+        try:
+            # Double-fork to detattch process from parent
+            pid = fork()
+            if pid:
+                # Sleep until second fork display message
+                sleep(1)
+                stdout.flush()
+                exit(0)
+            pid = fork()
+            if pid:
+                print "Start deloreand as daemon: pid %s" % pid
+                print "(listening for docbrown on port %s)" % self.docbrown.port
+                stdout.flush()
+                exit(0)
+        except OSError, err:
+            print >>stderr, "daemonize(): fork error: %s" % err
+            exit(1)
+
+        # Cleanup environment
+        chdir("/")
+        setsid()
+
+        # Close stdout, stin, stdout
+        close(0)
+        close(1)
+        close(2)
+
+    def load_config(self):
+        if self.daemon_mode:
+            return
+        home = getenv("HOME")
+        if not home:
+            return
+        self.config_file = path.join(home, ".deloreandrc")
+        try:
+            data = open(self.config_file).read(100)
+        except IOError:
+            return
+        try:
+            data = data.strip()
+            sec, nanosec = data.split("\n")
+            sec = float(sec)
+            nanosec = float(nanosec)
+            delta = timedelta(seconds=sec, microseconds=nanosec)
+        except (IOError, OverflowError, ValueError), err:
+            print "[!] Unable to reload delta: %s" % err
+            return
+        if not delta:
+            return
+        try:
+            question = raw_input("Do you want to reuse previous delta %s (y/n)? " % delta)
+            question = question.strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print "no"
+            question = "no"
+        if question in ("y", "yes"):
+            try:
+                self.setDelta(delta, verbose=False)
+            except ValueError, err:
+                print "[!] Unable to reload previous delta: %s" % err
+
+    def save_config(self):
+        if not self.config_file:
+            return
+        try:
+            # Get delta
+            sec = self.time_delta.seconds + (self.time_delta.days * 60*60*24)
+            us = self.time_delta.microseconds
+
+            # Store delta in config file
+            config = open(self.config_file, 'w')
+            config.write("%i\n" % sec)
+            config.write("%u" % us)
+            del config
+            print "[+] Delta saved in %s" % self.config_file
+        except (IOError, ValueError), err:
+            print >>stderr, "[!] Unable to save delta in %s: %s" % (self.config_file, err)
+
+    def serve_forever(self):
+        print "[+] Start server"
+        self.start()
+        try:
+            try:
+                if not self.daemon_mode:
+                    self.interact()
+                else:
+                    while True:
+                        sleep(3600)
+            except KeyboardInterrupt:
+                print "Interrupted (CTRL+C)."
+        finally:
+            print "[+] Stop server"
+            self.stop()
+
+    def changeClockSpeedText(self, text):
+        if " " in text:
+            text, updatestr = text.split(" ", 1)
+            # Parse update float
+            try:
+                update = float(updatestr)
+            except ValueError, err:
+                print "[+] Invalid update %r: %s" % (updatestr, err)
+                return
+        else:
+            update = 0.5
+
+        # Parse speed float
+        try:
+            speed = float(text)
+        except ValueError, err:
+            print "[+] Invalid speed %r: %s" % (text, err)
+            return
+        self.changeClockSpeed(speed, update)
+
+    def changeClockSpeed(self, speed=1.0, update=0.5):
+        """
+        Change clock speed. speed (float) parameter:
+          speed=-1.0 : reverse clock
+          speed= 0.0 : freeze clock
+          speed= 1.0 : normal clock (no change)
+          speed= 2.0 : double clock speed
+          ...
+
+        update (float) is the number of second between two time delta updates.
+        """
+        update = max(update, 0.010)
+        print "[+] Change block speed to %.1fx -- update each %.3f sec" \
+            % (speed, update)
+        print "Press CTRL+C to stop"
+        try:
+            delta0 = self.time_delta
+            time0 = time()
+            factor = (speed - 1.0)
+            while True:
+                delta = timedelta(seconds=(time() - time0))
+                delta = timedeltaFactor(delta, factor) + delta0
+                self.setDelta(delta, verbose=False)
+                sleep(update)
+        except KeyboardInterrupt:
+            pass
+        except ValueError, err:
+            print "Error: %s" % err
+        print "[+] Stop reverse clock."
+        self.printCurrentDelta()
+
+    def interact(self):
+        self.printCurrentDelta()
+        while True:
+            print
+            try:
+                text = raw_input("delta? ").strip()
+            except (EOFError, KeyboardInterrupt):
+                text = "quit"
+            stop = self.execInteract(text)
+            if stop:
+                return
+
+    def execInteract(self, text):
+        if text == "help":
+            displayHelp()
+            return False
+        if text == "quit":
+            print "quit"
+            return True
+        if not text:
+            print 'Enter "help" to get help or "quit" to exit'
+            return False
+        if text.startswith("speed "):
+            self.changeClockSpeedText(text[6:])
+        else:
+            self.command(text)
+        return False
+
+    def command(self, text, verbose=True):
+        if text == "current":
+            self.printCurrentDelta()
+            return True
+        if text != "reset":
+            relative, delta = parseDelta(text)
+        else:
+            delta = DELTA0
+            relative = False
+        if delta is not None:
+            try:
+                return self.setDelta(delta, relative, verbose)
+            except ValueError:
+                return False
+        else:
+            return False
+
+    def printCurrentDelta(self):
+        print "Current delta=%s" % self.time_delta
+
+    def getRawDelta(self):
+        self.delta_lock.acquire()
+        delta = self.time_delta
+        self.delta_lock.release()
+        if delta < DELTA0:
+            is_negative = 1
+            delta = abs(delta)
+        else:
+            is_negative = 0
+        sec = delta.seconds + (delta.days * 60*60*24)
+        nanosec = delta.microseconds*1000
+        raw = pack(PACK_FORMAT, is_negative, sec, nanosec)
+        return raw
+
+    def setDelta(self, delta, relative=False, verbose=True):
+        if relative:
+            try:
+                delta += self.time_delta
+            except OverflowError, err:
+                errmsg = "setDelta() overflow error! %s" % err
+                if verbose:
+                    print errmsg
+                    return False
+                else:
+                    raise ValueError(errmsg)
+        # Skip invalid values
+        if not (MIN_DELTA <= delta <= MAX_DELTA):
+            errmsg = "Invalid delta (have to be in %s..%s)" % (
+                    MIN_DELTA, MAX_DELTA)
+            if verbose:
+                print errmsg
+                return False
+            else:
+                raise ValueError(errmsg)
+
+        # Skip change if delta is the same
+        if self.time_delta == delta:
+            print "No delta change"
+            return True
+        self.time_delta = delta
+
+        # Send delta to clients
+        rawdata = self.getRawDelta()
+        self.sendToAll(rawdata)
+
+        # Display new delta
+        if verbose:
+            self.printCurrentDelta()
+        return True
+
+    def addMacfly(self, client):
+        raw = self.getRawDelta()
+        try:
+            client.send(raw)
+        except socket_error:
+            return
+        self.clients_lock.acquire()
+        self.clients.append(client)
+        self.clients_lock.release()
+
+    def sendToAll(self, data):
+        assert isinstance(data, str)
+        assert 1 <= len(data)
+
+        self.clients_lock.acquire()
+        try:
+            index = 0
+            while index < len(self.clients):
+                client = self.clients[index]
+                try:
+                    client.send(data)
+                except socket_error:
+                    del self.clients[index]
+                else:
+                    index += 1
+        finally:
+            self.clients_lock.release()
+
+    def start(self):
+        self.macfly.setup()
+        self.macfly.start()
+        if self.docbrown:
+            self.docbrown.setup()
+            self.docbrown.start()
+
+    def stop(self):
+        self.macfly.stop()
+        if self.docbrown:
+            self.docbrown.stop()
+        self.save_config()
+
+def isRunning():
+    sock = socket(AF_UNIX)
+    try:
+        sock.connect(SOCKET_FILENAME)
+        sock.close()
+    except socket_error, err:
+        if err[0] in (2, 111):
+            return False
+        print err[0]
+        print err
+        raise
+    return True
+
+def main():
+    if isRunning():
+        print >>stderr, "[!] Error: deloreand is already running"
+        exit(1)
+    if not((len(argv) == 2 and argv[1] == "-d") or (len(argv) == 1)):
+        print >>stderr, "usage: %s [-d]" % argv[0]
+        print >>stderr
+        print >>stderr, "   -d: run deloreand in daemon mode"
+        exit(1)
+    daemon_mode = (len(argv) == 2 and argv[1] == "-d")
+    delorean = Delorean(daemon_mode)
+    delorean.serve_forever()
+
+if __name__ == "__main__":
+    main()
+
